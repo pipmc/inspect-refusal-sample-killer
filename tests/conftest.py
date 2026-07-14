@@ -31,8 +31,16 @@ def run_eval_with_outputs(
     outputs: collections.abc.Sequence[inspect_ai.model.ModelOutput],
     *,
     generate_calls: int = 1,
+    park_between_generates: bool = True,
 ) -> inspect_ai.log.EvalLog:
-    """Run a one-sample eval whose solver calls generate `generate_calls` times."""
+    """Run a one-sample eval whose solver calls generate `generate_calls` times.
+
+    `park_between_generates` (default True) parks the solver briefly after each
+    generate; see the comment below. Set it False to model a real single-turn
+    eval whose final refusal has no subsequent in-sample work -- the documented
+    "final model call" limitation, where the breach is recorded but the sample
+    is not terminated (see `test_final_generate_refusal_recorded_not_terminated`).
+    """
 
     @inspect_ai.solver.solver
     def multi_generate() -> inspect_ai.solver.Solver:
@@ -48,8 +56,11 @@ def run_eval_with_outputs(
                 # drain the queue, run our hook, and land its task-group cancel
                 # while the solver is still awaiting -- so a refusal breach is
                 # observed and terminated deterministically. Real models supply
-                # this yield time naturally via network I/O.
-                await asyncio.sleep(0.05)
+                # this yield time naturally via network I/O (in a multi-step
+                # agent, the next model call is the awaiting work); a real
+                # single-turn eval has none, which is the documented limitation.
+                if park_between_generates:
+                    await asyncio.sleep(0.05)
             return state
 
         return solve

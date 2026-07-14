@@ -103,3 +103,4 @@ def test_message_degrades_without_explanation():
         model_name="m", refusals=1, max_refusals=0, category=None, explanation=None
     )
     assert "no explanation provided" in message
+    assert "(None)" not in message  # category parenthetical omitted, not rendered

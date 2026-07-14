@@ -63,3 +63,20 @@ def test_normal_output_never_trips(monkeypatch: pytest.MonkeyPatch):
     log = run_eval_with_outputs([normal_output()])
     assert log.status == "success"
     assert _sample_limit(log) is None
+
+
+def test_final_generate_refusal_recorded_not_terminated(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Documented limitation: a refusal on a sample's FINAL model call cannot
+    # convert to a sample limit (no subsequent in-sample work for the async
+    # cancel to interrupt, no further generate for the inline backstop). The
+    # breach is still recorded in the transcript. `park_between_generates=False`
+    # models the single-turn case (no trailing await after the refusal).
+    monkeypatch.delenv(config.ENV_VAR, raising=False)  # default 0
+    log = run_eval_with_outputs([refusal_output()], park_between_generates=False)
+
+    assert log.status == "success"
+    assert _sample_limit(log) is None  # not terminated
+    # ...but the breach is recorded so it is visible in the log/viewer.
+    assert any("refused 1 requests" in m for m in _limit_event_messages(log))

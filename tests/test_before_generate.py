@@ -59,6 +59,7 @@ def test_noop_when_count_not_over_limit(monkeypatch: pytest.MonkeyPatch):
     )
 
     asyncio.run(hook.on_before_model_generate(_before_data()))  # must not raise
+    assert hook._recorded == set()  # no limit event recorded when under threshold
 
 
 def test_noop_when_no_active_sample(monkeypatch: pytest.MonkeyPatch):
@@ -68,3 +69,4 @@ def test_noop_when_no_active_sample(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(inspect_ai.log._samples, "sample_active", lambda: None)
 
     asyncio.run(hook.on_before_model_generate(_before_data()))  # must not raise
+    assert hook._recorded == set()  # no limit event recorded without an active sample
