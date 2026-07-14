@@ -23,17 +23,21 @@ when a refusal actually reached the transcript.
 
 ## Package structure
 
-Distribution name `inspect-fallback-run-killer`, import package
-`inspect_fallback_run_killer`:
+Distribution name `inspect-refusal-sample-killer`, import package
+`inspect_refusal_sample_killer`:
 
 ```
-src/inspect_fallback_run_killer/
+src/inspect_refusal_sample_killer/
   __init__.py        # public exports
   _hooks.py          # Hooks subclass, detection + counting + kill logic
-  _registry.py       # imports _hooks to register decorated hooks
+  _tasks.py          # registered `classifier_refusal_probe` task (+ REFUSAL_PROMPT)
+  _registry.py       # imports _hooks and _tasks to register decorated objects
 tests/
-  test_hooks.py      # mockllm end-to-end tests
-  test_integration.py  # live Fable test (marked integration)
+  test_config.py         # unit: env-var parsing
+  test_detection.py      # unit: detection + message building
+  test_before_generate.py  # unit: inline on_before_model_generate backstop
+  test_hooks.py          # mockllm end-to-end tests
+  test_integration.py    # live Fable test (marked integration)
 .devcontainer/
   devcontainer.json
   Dockerfile
@@ -41,11 +45,21 @@ pyproject.toml
 README.md
 ```
 
-Registered via the `inspect_ai` entry-point group so it activates on install:
+Registered via the `inspect_ai` entry-point group so both the hook and the
+probe task activate on install:
 
 ```toml
 [project.entry-points.inspect_ai]
-inspect_fallback_run_killer = "inspect_fallback_run_killer._registry"
+inspect_refusal_sample_killer = "inspect_refusal_sample_killer._registry"
+```
+
+`_registry.py` imports both `_hooks` and `_tasks`, so the entry point exposes
+the hook *and* a registered task the user can run standalone to exercise the
+hook against a real model:
+
+```bash
+inspect eval inspect_refusal_sample_killer/classifier_refusal_probe \
+    --model anthropic/claude-fable-5-data-retention
 ```
 
 ## Hook behavior
@@ -54,7 +68,9 @@ inspect_fallback_run_killer = "inspect_fallback_run_killer._registry"
 
 - `enabled()` — `False` when `INSPECT_MAX_CLASSIFIER_REFUSALS` parses to a
   negative integer; `True` otherwise.
-- `on_sample_event(data: SampleEvent)` — detection, counting, kill.
+- `on_sample_event(data: SampleEvent)` — detection, counting, async kill.
+- `on_before_model_generate(data: BeforeModelGenerate)` — inline deterministic
+  backstop (see Kill mechanism).
 - `on_sample_end` / `on_sample_attempt_end` — clean up counting state.
 
 ### Detection
@@ -78,40 +94,38 @@ An event counts as a classifier refusal when all of:
 
 ### Kill mechanism
 
-`on_sample_event` is dispatched from Inspect's background sample-event emitter,
-which catches all exceptions including `LimitExceededError` — so the hook
-cannot simply raise. Instead, when `refusals > max_refusals`:
+A hook cannot both observe a refusal and synchronously raise from the same
+model call: the only hook carrying the model *output* is `on_sample_event`,
+which is dispatched from Inspect's background emitter (it catches every
+exception, including `LimitExceededError`). So termination uses two
+complementary mechanisms, and whichever fires first wins:
 
-1. Build the error:
+**1. `on_sample_event` (async).** On each completed refusal `ModelEvent`, count
+it; when `refusals > max_refusals`:
+   - Build `LimitExceededError(type="custom", value=refusals, limit=max_refusals,
+     message=…)` where the message is the verbatim base string plus the
+     `. Latest refusal ({category}): {explanation}` suffix (degrading to
+     `no explanation provided` / dropping `({category})` when absent).
+   - Record `SampleLimitEvent(type="custom", limit=max_refusals, message=…)` to
+     the transcript (once per sample) so the full message is visible in the
+     log/viewer — `EvalSampleLimit` stores only type + limit.
+   - Call `sample_active().limit_exceeded(err)`, which cancels the sample's task
+     group. This lands while the sample is still doing work (e.g. awaiting the
+     next model call), so it converts to a `custom` `EvalSampleLimit` in
+     multi-step / agentic evals.
 
-   ```python
-   LimitExceededError(
-       type="custom",
-       value=refusals,
-       limit=max_refusals,
-       message=(
-           f"The model {model_name} refused {refusals} requests due to a "
-           f"classifier policy trigger, which exceeds the limit of "
-           f"{max_refusals} refusals. Latest refusal ({category}): {explanation}"
-       ),
-   )
-   ```
+**2. `on_before_model_generate` (inline).** Before each model call, if the
+sample's refusal count (keyed by `sample_active().sample_uuid`) already exceeds
+the limit, raise `LimitExceededError` directly. `emit_before_model_generate`
+runs inline within `generate()` and re-raises `LimitExceededError`, so it
+propagates to the runner, which records a `custom` sample limit — deterministic,
+and without making another (also-refused) call. It records the same
+`SampleLimitEvent` first (idempotent via a per-sample "recorded" set).
 
-   `model_name` comes from the `ModelEvent`. `category` and `explanation` come
-   from `stop_details` of the refusal that breached the limit; when absent the
-   suffix degrades gracefully (e.g. `Latest refusal: no explanation provided`).
-
-2. Record `SampleLimitEvent(type="custom", limit=max_refusals, message=...)` to
-   the transcript (mirroring what built-in token/cost limits do), so the full
-   message including the explanation is visible in the log and viewer —
-   `EvalSampleLimit` itself only stores type and limit.
-
-3. Call `sample_active().limit_exceeded(err)` — the same internal path
-   Inspect's working-limit monitor uses: it stores the error on the
-   `ActiveSample`, fires interrupt cleanup, and cancels the sample's task
-   group. The runner's cancellation handler records the result as a sample
-   limit (`EvalSampleLimit`, `type="custom"`); the sample proceeds to scoring
-   like any other limit-hit sample and the run continues.
+Either way the sample ends as a `custom` `EvalSampleLimit`, proceeds to scoring,
+and the run continues. Note that an Inspect limit is *not* an error: the eval
+`status` stays `success` and the outcome is observed as
+`sample.limit.type == "custom"`.
 
 ### Private-API use
 
@@ -123,9 +137,15 @@ failures, not silent no-ops.
 
 ### Edge cases
 
-- Refusal on the solver's final generate: the cancellation may land after the
-  solver already finished; the sample then completes normally and the kill is
-  a logged no-op. Documented limitation.
+- **Refusal on the sample's final model call (known limitation, validated
+  live):** neither mechanism can convert it to a sample limit — there is no
+  subsequent in-sample work for the async cancel to interrupt, and no further
+  `generate()` for the inline backstop. The breach is still recorded as a
+  `SampleLimitEvent` in the transcript, but `sample.limit` stays `None` and
+  `status` is `success`. This is why the probe task and live test use an
+  agentic (`basic_agent`) solver rather than a single generate: the repeated
+  model calls give the hook the in-sample work it needs. Single-turn tasks
+  (one generate then done) are therefore not terminated — only recorded.
 - No active sample or task group not running: log a warning, never crash the
   emitter.
 - Multiple concurrent samples: state is keyed by sample uuid, so counts never
@@ -150,17 +170,30 @@ Default suite (offline, must pass in devcontainer and CI):
 4. **Disabled (`-1`):** refusal outputs flow through; sample completes.
 5. **Control:** normal outputs never increment or kill.
 
-Env var manipulation via pytest `monkeypatch`.
+Env var manipulation via pytest `monkeypatch`. These mockllm tests exercise the
+async `on_sample_event` path; because the mockllm solver is near-instant, the
+test solver `await asyncio.sleep(...)`s after each generate to give the
+background emitter the scheduling point a real model provides via network I/O.
+The inline `on_before_model_generate` backstop cannot be driven end-to-end via
+mockllm (the async path preempts it), so it has focused unit tests in
+`test_before_generate.py` that seed the hook's per-sample count, stub
+`sample_active`, and assert it raises a `custom` `LimitExceededError` when over
+the limit (and is a no-op when under, or when no sample is active).
 
 Live integration test:
 
 - Marked `integration`; excluded by default via
   `addopts = "-m 'not integration'"` in pyproject.
 - Skipped unless `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` are set.
-- Runs `anthropic/claude-fable-5` with a prompt that reliably triggers a
-  classifier decline (exact prompt validated empirically during
-  implementation); asserts the same `limit.type == "custom"` outcome and
-  message content.
+- Runs the agentic `classifier_refusal_probe` task against
+  `anthropic/claude-fable-5-data-retention` (the data-retention-enabled model id
+  available through METR middleman; plain `claude-fable-5` is gated) and asserts
+  `limit.type == "custom"` with the refusal message in the transcript. The
+  `basic_agent` solver's repeated calls give the hook the in-sample work needed
+  to terminate (a single generate would only be recorded, per the known
+  limitation). Validated live during implementation.
+- Requires the `anthropic` package (inspect's Anthropic provider prerequisite),
+  added as a dev dependency.
 - Invocation:
 
   ```bash
@@ -189,12 +222,6 @@ Adapted from `~/Code/task-assets/.devcontainer`:
   `uv sync --locked`, `UV_PROJECT_ENVIRONMENT=/opt/python`), same non-root
   user/volume layout.
 - Omit the AWS CLI stage and the `~/.aws` bind mount (not needed).
-- Container/volume/hostname renamed to `inspect-fallback-run-killer`.
+- Container/volume/hostname renamed to `inspect-refusal-run-killer`.
 - VS Code customizations kept: ruff formatter, pytest test discovery, strict
   type checking.
-
-## Naming note
-
-The repo is named `inspect-fallback-run-killer` but the agreed behavior
-terminates the *sample* (as a limit), not the run. Keeping the name; the README
-documents the actual behavior.
