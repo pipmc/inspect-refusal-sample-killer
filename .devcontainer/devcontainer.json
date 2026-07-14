@@ -1,0 +1,43 @@
+{
+  "name": "inspect-refusal-sample-killer",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "${localWorkspaceFolder}"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/home/metr/app,type=bind,consistency=cached",
+  "workspaceFolder": "/home/metr/app",
+  "mounts": [
+    {
+      "source": "inspect-refusal-sample-killer-home",
+      "target": "/home/metr",
+      "type": "volume"
+    }
+  ],
+  "runArgs": [
+    "--name=inspect-refusal-sample-killer",
+    "--hostname=inspect-refusal-sample-killer"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "charliermarsh.ruff",
+        "editorconfig.editorconfig",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "python.defaultInterpreterPath": "/opt/python/bin/python",
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff"
+        },
+        "python.testing.pytestArgs": ["tests"],
+        "python.testing.unittestEnabled": false,
+        "python.testing.pytestEnabled": true
+      }
+    }
+  },
+  "remoteUser": "metr",
+  "overrideCommand": false
+}
